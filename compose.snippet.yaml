@@ -3,12 +3,12 @@
 # then point a Cloudflare Tunnel hostname at it (e.g. studio-git.kitcab.co.nz -> http://forgejo-gitlab-shim:8080).
 services:
   forgejo-gitlab-shim:
-    build: ./forgejo-gitlab-shim
+    image: ghcr.io/victpork/forgejo-gitlab-shim:latest
     container_name: forgejo-gitlab-shim
     restart: unless-stopped
     environment:
       FORGEJO_URL: http://forgejo:3000                      # internal address of Forgejo (service name + port)
-      FORGEJO_PUBLIC_URL: https://forgejo.kitcab.co.nz      # used for "view commit/file" links in Studio
+      FORGEJO_PUBLIC_URL: https://forgejo.com               # used for "view commit/file" links in Studio
       ALLOWED_ORIGINS: https://your-site.example            # origin(s) of the Nuxt site that runs Studio, comma-separated
       ALLOWED_REPOS: your-user/your-repo                    # optional: only expose these repos
       # MAX_BODY_MB: 25                                     # max publish size (media uploads are base64)
