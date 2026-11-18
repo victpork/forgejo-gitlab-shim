@@ -64,7 +64,7 @@ func newMockForgejo(t *testing.T) *mockForgejo {
 		{Operation: "create", Path: "content/blog/first.md", buf: []byte("---\ntitle: First\n---\n\nPost\n")},
 		{Operation: "create", Path: "nuxt.config.ts", buf: []byte("export default {}\n")},
 	}
-	if _, err := m.commit(seed, "seed", "Seed", "seed@x"); err != nil {
+	if _, err := m.commit(seed, "seed", mockIdentity{"Seed", "seed@x"}, mockIdentity{"Seed", "seed@x"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	return m
@@ -128,7 +128,12 @@ func (m *mockForgejo) ls(ref, p string) *lsEntry {
 	return &lsEntry{f[0], f[1], f[2], name}
 }
 
-func (m *mockForgejo) commit(ops []mockOp, message, name, email string) (string, error) {
+type mockIdentity struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+func (m *mockForgejo) commit(ops []mockOp, message string, author, committer mockIdentity) (string, error) {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
 	idx := []string{"GIT_INDEX_FILE=" + filepath.Join(m.tmp, fmt.Sprintf("index-%d", time.Now().UnixNano()))}
@@ -167,7 +172,7 @@ func (m *mockForgejo) commit(ops []mockOp, message, name, email string) (string,
 		args = append(args, "-p", parent)
 	}
 	args = append(args, "-m", message)
-	id := []string{"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email, "GIT_COMMITTER_NAME=" + name, "GIT_COMMITTER_EMAIL=" + email}
+	id := []string{"GIT_AUTHOR_NAME=" + author.Name, "GIT_AUTHOR_EMAIL=" + author.Email, "GIT_COMMITTER_NAME=" + committer.Name, "GIT_COMMITTER_EMAIL=" + committer.Email}
 	sha, err := m.run(id, nil, args...)
 	if err != nil {
 		return "", err
@@ -236,13 +241,11 @@ func (m *mockForgejo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodPost && r.URL.Path == base:
 		var body struct {
-			Branch  string   `json:"branch"`
-			Message string   `json:"message"`
-			Files   []mockOp `json:"files"`
-			Author  *struct {
-				Name  string `json:"name"`
-				Email string `json:"email"`
-			} `json:"author"`
+			Branch    string        `json:"branch"`
+			Message   string        `json:"message"`
+			Files     []mockOp      `json:"files"`
+			Author    *mockIdentity `json:"author"`
+			Committer *mockIdentity `json:"committer"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			mockSend(w, 400, msg("bad json"))
@@ -295,11 +298,19 @@ func (m *mockForgejo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.buf = buf
 			ops = append(ops, f)
 		}
-		name, email := "Token User", "token@x"
-		if body.Author != nil && body.Author.Name != "" {
-			name, email = body.Author.Name, body.Author.Email
+		// Forgejo: a missing author/committer falls back to the other, then to the token's user.
+		doer := mockIdentity{"Token User", "token@x"}
+		author, committer := body.Author, body.Committer
+		if author == nil || author.Name == "" {
+			author = committer
 		}
-		sha, err := m.commit(ops, body.Message, name, email)
+		if committer == nil || committer.Name == "" {
+			committer = author
+		}
+		if author == nil || author.Name == "" {
+			author, committer = &doer, &doer
+		}
+		sha, err := m.commit(ops, body.Message, *author, *committer)
 		if err != nil {
 			mockSend(w, 500, msg(err.Error()))
 			return
@@ -307,7 +318,7 @@ func (m *mockForgejo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		now := time.Now().UTC().Format(time.RFC3339)
 		mockSend(w, 201, map[string]any{
 			"files":  []any{},
-			"commit": map[string]any{"sha": sha, "author": map[string]string{"name": name, "email": email, "date": now}, "created": now},
+			"commit": map[string]any{"sha": sha, "author": map[string]string{"name": author.Name, "email": author.Email, "date": now}, "created": now},
 		})
 
 	default:

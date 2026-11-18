@@ -36,6 +36,9 @@ type config struct {
 	forgejoPublicURL string // what browsers use, for redirects
 	allowedOrigins   []string
 	allowedRepos     []string // lower-cased "owner/repo"; empty = all
+	allowedBranches  []string // commits are refused on any other branch
+	allowedPaths     []string // commit paths must start with one of these ("content/")
+	committer        identity // git committer of every commit (the bot account)
 	maxBodyBytes     int64
 	logRequests      bool
 }
@@ -108,6 +111,18 @@ func loadConfig() config {
 	c.allowedOrigins = list(os.Getenv("ALLOWED_ORIGINS"))
 	for _, r := range list(os.Getenv("ALLOWED_REPOS")) {
 		c.allowedRepos = append(c.allowedRepos, strings.ToLower(r))
+	}
+	c.allowedBranches = list(envOr("ALLOWED_BRANCHES", "main"))
+	for _, p := range list(envOr("ALLOWED_PATHS", "content/")) {
+		dir := strings.TrimSuffix(p, "/")
+		if checkPath(dir) != nil {
+			fail("ALLOWED_PATHS: %q is not a clean relative directory", p)
+		}
+		c.allowedPaths = append(c.allowedPaths, dir+"/")
+	}
+	c.committer = identity{os.Getenv("COMMITTER_NAME"), os.Getenv("COMMITTER_EMAIL")}
+	if c.committer.Name == "" || c.committer.Email == "" {
+		fail("Missing required env vars COMMITTER_NAME and COMMITTER_EMAIL (the bot account's git identity)")
 	}
 	mb, err := strconv.ParseFloat(envOr("MAX_BODY_MB", "25"), 64)
 	if err != nil || mb <= 0 {
@@ -391,10 +406,11 @@ type identity struct {
 }
 
 type commitPayload struct {
-	Branch  string    `json:"branch"`
-	Message string    `json:"message"`
-	Files   []fileOp  `json:"files"`
-	Author  *identity `json:"author,omitempty"`
+	Branch    string    `json:"branch"`
+	Message   string    `json:"message"`
+	Files     []fileOp  `json:"files"`
+	Author    *identity `json:"author,omitempty"`
+	Committer *identity `json:"committer"`
 }
 
 type gitlabCommit struct {
@@ -408,12 +424,63 @@ type gitlabCommit struct {
 	WebURL      string `json:"web_url"`
 }
 
+// checkPath rejects anything that isn't a plain relative path: no "..", ".", empty
+// segments, absolute paths, backslashes, control characters or .git directories.
+// It checks the raw string, so there is nothing for a later normalisation step to reinterpret.
+func checkPath(p string) error {
+	if p == "" {
+		return herr(400, "file_path is required")
+	}
+	if strings.HasPrefix(p, "/") || strings.ContainsRune(p, '\\') {
+		return herr(403, "path %q is not allowed: must be relative, with forward slashes", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return herr(403, "path %q is not allowed: control character", p)
+		}
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." || strings.EqualFold(seg, ".git") {
+			return herr(403, "path %q is not allowed: segment %q", p, seg)
+		}
+	}
+	return nil
+}
+
+// checkWritePath allows a commit to touch p only if it is a clean path inside an allowed directory.
+func checkWritePath(p string) error {
+	if err := checkPath(p); err != nil {
+		return err
+	}
+	for _, prefix := range cfg.allowedPaths {
+		if strings.HasPrefix(p, prefix) {
+			return nil
+		}
+	}
+	return herr(403, "path %q is not allowed: commits may only change files under %s", p, strings.Join(cfg.allowedPaths, ", "))
+}
+
+// checkCommit refuses the whole request before anything reaches Forgejo.
+func checkCommit(body commitRequest) error {
+	if !slices.Contains(cfg.allowedBranches, body.Branch) {
+		return herr(403, "branch %q is not allowed", body.Branch)
+	}
+	for _, a := range body.Actions {
+		if err := checkWritePath(a.FilePath); err != nil {
+			return err
+		}
+		if a.Action == "move" && a.PreviousPath != "" {
+			if err := checkWritePath(a.PreviousPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // resolveAction turns one GitLab action into a Forgejo file operation (nil = nothing to do).
 func resolveAction(ctx context.Context, auth, owner, repo, branch string, a gitlabAction) (*fileOp, error) {
-	path := a.FilePath
-	if path == "" {
-		return nil, herr(400, "action.file_path is required")
-	}
+	path := a.FilePath // already checked by checkCommit
 	existing, err := getFile(ctx, auth, owner, repo, path, branch)
 	if err != nil {
 		return nil, err
@@ -469,6 +536,9 @@ func handleCommit(w http.ResponseWriter, r *http.Request, rawID string) (any, er
 	if body.Branch == "" || body.CommitMessage == "" || len(body.Actions) == 0 {
 		return nil, herr(400, "branch, commit_message and actions are required")
 	}
+	if err := checkCommit(body); err != nil {
+		return nil, err
+	}
 
 	// Forgejo needs the current blob sha for update/delete. Look them up in parallel.
 	ops := make([]*fileOp, len(body.Actions))
@@ -499,7 +569,9 @@ func handleCommit(w http.ResponseWriter, r *http.Request, rawID string) (any, er
 		return nil, herr(400, "nothing to commit (all deleted files were already absent)")
 	}
 
-	payload := commitPayload{Branch: body.Branch, Message: body.CommitMessage, Files: files}
+	// The editor is the author; the committer is always the configured bot identity, whatever the request says.
+	committer := cfg.committer
+	payload := commitPayload{Branch: body.Branch, Message: body.CommitMessage, Files: files, Author: &committer, Committer: &committer}
 	if body.AuthorName != "" && body.AuthorEmail != "" {
 		payload.Author = &identity{body.AuthorName, body.AuthorEmail}
 	}

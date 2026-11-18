@@ -44,6 +44,9 @@ func setup(t *testing.T) *testEnv {
 		forgejoPublicURL: publicURL,
 		allowedOrigins:   []string{siteOrigin},
 		allowedRepos:     []string{"kit/site"},
+		allowedBranches:  []string{"main"},
+		allowedPaths:     []string{"content/"},
+		committer:        identity{"Content Bot", "content-bot@kitcab.co.nz"},
 		maxBodyBytes:     25 << 20,
 	}
 	shim := httptest.NewServer(http.HandlerFunc(handle))
@@ -282,7 +285,7 @@ func TestOnePublishIsOneCommit(t *testing.T) {
 		{path: "content/new.md", content: "# Kia ora ✓ é 日本語\n", status: draftCreated},
 		{path: "content/index.md", content: "# Home\n\nUpdated\n", status: draftUpdated},
 		{path: "content/blog/first.md", status: draftDeleted},
-		{path: "public/img/logo.png", content: "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), status: draftCreated, encoding: "base64"},
+		{path: "content/img/logo.png", content: "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), status: draftCreated, encoding: "base64"},
 		{path: "content/untouched.md", content: "x", status: draftPristine},
 	}, "Studio: update content")
 
@@ -298,7 +301,7 @@ func TestOnePublishIsOneCommit(t *testing.T) {
 	eq(t, strings.TrimSpace(git("ls-tree", "main", "--", "content/blog/first.md")), "", "deleted")
 	eq(t, strings.TrimSpace(git("ls-tree", "main", "--", "content/untouched.md")), "", "pristine skipped")
 
-	f := e.studio.fetchFile(t, "public/img/logo.png")
+	f := e.studio.fetchFile(t, "content/img/logo.png")
 	if f == nil {
 		t.Fatal("png not found")
 	}
@@ -322,6 +325,7 @@ func TestRootDirPathsArePassedThrough(t *testing.T) {
 	e := setup(t)
 	s := e.studio
 	s.rootDir, s.authorName, s.authorEmail = "apps/web", "A", "a@x"
+	cfg.allowedPaths = []string{"apps/web/content/"}
 	s.commitFiles(t, []draft{{path: "content/x.md", content: "mono\n", status: draftCreated}}, "mono")
 	eq(t, e.forgejo.git("show", "main:apps/web/content/x.md"), "mono\n", "committed under rootDir")
 	f := s.fetchFile(t, "content/x.md")
@@ -338,6 +342,11 @@ func TestAuthHeadersAreTranslated(t *testing.T) {
 	eq(t, get(t, u, map[string]string{"Authorization": "Bearer " + mockToken}).StatusCode, 200, "Bearer")
 	eq(t, get(t, u, map[string]string{"Authorization": "Bearer wrong"}).StatusCode, 401, "wrong token")
 	eq(t, get(t, u, nil).StatusCode, 401, "no token")
+	noToken := e.studio
+	noToken.token = ""
+	req, _ := http.NewRequest("POST", noToken.api("/repository/commits"), strings.NewReader(`{"branch":"main","commit_message":"m","actions":[{"action":"create","file_path":"content/a.md","content":"a"}]}`))
+	status, _ := do(t, req)
+	eq(t, status, 401, "commit without token")
 	for _, h := range e.forgejo.authHeaders() {
 		if h != "" && !strings.HasPrefix(h, "token ") {
 			t.Errorf("Forgejo got Authorization %q, want \"token ...\"", h)
@@ -347,9 +356,10 @@ func TestAuthHeadersAreTranslated(t *testing.T) {
 
 func TestCommitErrorsFromForgejoSurface(t *testing.T) {
 	e := setup(t)
+	cfg.allowedBranches = []string{"main", "nope"} // allowed by the gate, missing in Forgejo
 	status, body := e.studio.postCommit(t, map[string]any{
 		"branch": "nope", "commit_message": "m",
-		"actions": []map[string]string{{"action": "create", "file_path": "a.md", "content": "a"}},
+		"actions": []map[string]string{{"action": "create", "file_path": "content/a.md", "content": "a"}},
 	})
 	eq(t, status, 404, "status")
 	var r struct{ Message string }
@@ -386,6 +396,31 @@ func TestCORS(t *testing.T) {
 	eq(t, ok.Header.Get("Access-Control-Allow-Origin"), siteOrigin, "allowed origin on response")
 	evil := get(t, e.shim.URL+"/healthz", map[string]string{"Origin": "https://evil.example"})
 	eq(t, evil.Header.Get("Access-Control-Allow-Origin"), "", "other origin")
+}
+
+func TestCORSProductionOrigins(t *testing.T) {
+	e := setup(t)
+	cfg.allowedOrigins = list("https://kitcab.co.nz, https://preview.staging.kitcab.co.nz, http://localhost:8787")
+	preflight := func(origin string) *http.Response {
+		req, _ := http.NewRequest("OPTIONS", e.studio.api("/repository/commits"), nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
+		res, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res
+	}
+	for _, o := range cfg.allowedOrigins {
+		res := preflight(o)
+		eq(t, res.StatusCode, 204, o+" status")
+		eq(t, res.Header.Get("Access-Control-Allow-Origin"), o, o+" allow-origin")
+	}
+	for _, o := range []string{"https://evil.example", "https://kitcab.co.nz.evil.example", "http://kitcab.co.nz", "https://www.kitcab.co.nz"} {
+		eq(t, preflight(o).Header.Get("Access-Control-Allow-Origin"), "", o+" allow-origin")
+	}
 }
 
 func TestStudioLinksRedirectToForgejo(t *testing.T) {
@@ -446,4 +481,79 @@ func TestToBase64(t *testing.T) {
 	for _, c := range cases {
 		eq(t, toBase64(c.content, c.encoding), c.want, fmt.Sprintf("toBase64(%v, %q)", c.content, c.encoding))
 	}
+}
+
+// ---------- content gate: what a leaked token can do ----------
+
+func TestCommitsOutsideContentAreRefusedWhole(t *testing.T) {
+	bad := []string{
+		"proto41-guard2.txt",
+		"content/../x.txt",
+		"content/./x.txt",
+		"content//x.txt",
+		"content/",
+		"/content/x.txt",
+		`content\x.txt`,
+		"content/a/../../x.txt",
+		"content/..",
+		"contentx/x.txt",
+		"Content/x.txt",
+		"content/.git/config",
+		"content/x\x00.txt",
+		"",
+	}
+	for _, p := range bad {
+		t.Run(p, func(t *testing.T) {
+			e := setup(t)
+			before := strings.TrimSpace(e.forgejo.git("rev-parse", "main"))
+			status, body := e.studio.postCommit(t, map[string]any{
+				"branch": "main", "commit_message": "m",
+				"actions": []map[string]string{
+					{"action": "create", "file_path": "content/ok.md", "content": "ok"},
+					{"action": "create", "file_path": p, "content": "x"},
+				},
+			})
+			if status < 400 || status >= 500 {
+				t.Errorf("status %d %s, want 4xx", status, body)
+			}
+			eq(t, strings.TrimSpace(e.forgejo.git("rev-parse", "main")), before, "no new commit")
+		})
+	}
+}
+
+func TestMoveFromOutsideContentIsRefused(t *testing.T) {
+	e := setup(t)
+	status, _ := e.studio.postCommit(t, map[string]any{
+		"branch": "main", "commit_message": "move",
+		"actions": []map[string]string{{"action": "move", "previous_path": "nuxt.config.ts", "file_path": "content/config.ts"}},
+	})
+	eq(t, status, 403, "status")
+	eq(t, e.forgejo.git("show", "main:nuxt.config.ts"), "export default {}\n", "source untouched")
+}
+
+func TestCommitsToOtherBranchesAreRefused(t *testing.T) {
+	e := setup(t)
+	cfg.allowedBranches = []string{"prototype/41-studio-commits"} // main itself not allowed
+	before := strings.TrimSpace(e.forgejo.git("rev-parse", "main"))
+	for _, b := range []string{"main", "prototype/not-allowed", "Prototype/41-studio-commits", "prototype/41-studio-commits/x"} {
+		status, body := e.studio.postCommit(t, map[string]any{
+			"branch": b, "commit_message": "m",
+			"actions": []map[string]string{{"action": "create", "file_path": "content/ok.md", "content": "ok"}},
+		})
+		eq(t, status, 403, "branch "+b+": "+string(body))
+	}
+	eq(t, strings.TrimSpace(e.forgejo.git("rev-parse", "main")), before, "no new commit")
+}
+
+func TestCommitterIsAlwaysTheBot(t *testing.T) {
+	e := setup(t)
+	status, body := e.studio.postCommit(t, map[string]any{
+		"branch": "main", "commit_message": "m",
+		"author_name": "Kit Editor", "author_email": "kit@kitcab.co.nz",
+		"committer_name": "Mallory", "committer_email": "mallory@evil.example", // not GitLab fields; must be ignored
+		"actions": []map[string]string{{"action": "create", "file_path": "content/prototype/gate-ok.txt", "content": "ok"}},
+	})
+	eq(t, status, 201, "status: "+string(body))
+	eq(t, strings.TrimSpace(e.forgejo.git("log", "-1", "--format=%an <%ae>|%cn <%ce>", "main")),
+		"Kit Editor <kit@kitcab.co.nz>|Content Bot <content-bot@kitcab.co.nz>", "author|committer")
 }

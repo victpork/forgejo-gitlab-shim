@@ -11,6 +11,10 @@ services:
       FORGEJO_PUBLIC_URL: https://forgejo.com               # used for "view commit/file" links in Studio
       ALLOWED_ORIGINS: https://your-site.example            # origin(s) of the Nuxt site that runs Studio, comma-separated
       ALLOWED_REPOS: your-user/your-repo                    # optional: only expose these repos
+      ALLOWED_BRANCHES: main                                # branches commits may go to, comma-separated (default: main)
+      ALLOWED_PATHS: content/                               # directories commits may change, comma-separated (default: content/)
+      COMMITTER_NAME: content-bot                           # required: git committer of every commit (the token's bot account)
+      COMMITTER_EMAIL: content-bot@your-forgejo-host.com    # required
       # MAX_BODY_MB: 25                                     # max publish size (media uploads are base64)
     depends_on:
       - forgejo

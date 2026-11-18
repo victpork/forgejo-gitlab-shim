@@ -24,6 +24,9 @@ Copy this folder next to your Forgejo `compose.yaml`, then add the service from 
 - `FORGEJO_PUBLIC_URL` – `https://your-forgejo-host.com`
 - `ALLOWED_ORIGINS` – the origin of your Nuxt site (Studio calls the shim **from the editor's browser**, so CORS is required)
 - `ALLOWED_REPOS` – optional, e.g. `kit/site`
+- `ALLOWED_BRANCHES` – branches commits may go to, comma-separated (default `main`)
+- `ALLOWED_PATHS` – directories commits may change, comma-separated (default `content/`)
+- `COMMITTER_NAME`, `COMMITTER_EMAIL` – required: the git committer of every commit (the bot account, e.g. `content-bot`)
 
 ```sh
 docker compose up -d --build forgejo-gitlab-shim
@@ -68,6 +71,8 @@ Studio needs the site deployed with a server (SSR), and your CI must rebuild on 
 
 ## Behaviour notes
 
+- **Content gate.** The token reaches every editor's browser, so the shim limits what it can do. A commit is refused whole (403, nothing written) if its branch isn't in `ALLOWED_BRANCHES` or any path isn't a clean relative path under `ALLOWED_PATHS`. Paths with `..`, `.`, empty segments, a leading `/`, backslashes, control characters or `.git` are refused as given, before any normalisation. Studio uploads media to `public/`, so with the default those uploads are refused; widening `ALLOWED_PATHS` widens what a leaked token can change.
+- **Committer.** The commit author is the editor's name and email from Studio. The committer is always `COMMITTER_NAME <COMMITTER_EMAIL>`, whatever the request says.
 - **Upserts.** A create for a file that already exists becomes an update, and vice versa; deleting a file that's already gone is skipped. This keeps a stale draft from blocking a publish.
 - **The token reaches the browser.** This is how Studio's GitHub and GitLab providers work too. Scope the token to the content repo (a dedicated Forgejo user with access to just that repo is ideal).
 - **Upgrades.** If a future Studio release calls other GitLab endpoints, the shim returns `404 … shim does not implement …` and logs it. Pin `nuxt-studio` and check `src/app/src/utils/providers/gitlab.ts` before upgrading.
